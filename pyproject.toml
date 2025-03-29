@@ -1,0 +1,55 @@
+[project]
+authors = [{ name = "iimuz", email = "iz.primary.story+github@gmail.com" }]
+description = "Sample for langchain and llama index."
+license = { file = "LICENSE" }
+name = "langchain_llamaindex"
+readme = "README.md"
+requires-python = ">=3.11"
+urls = { repository = "https://github.com/iimuz/langchain_llamaindex" }
+version = "1.0.0"
+
+dependencies = []
+
+[tools.setuptools.package-dir]
+langchain_llamaindex = "src"
+
+[project.optional-dependencies]
+dev = [
+  "mypy",
+  "ruff",
+]
+test = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+
+[tool.ruff]
+# same as black
+indent-width = 4
+line-length = 88
+
+extend-exclude = [
+  ".vscode",
+  "data",
+]
+
+[tool.ruff.lint]
+# Allow lint for all enabled rules
+ignore = [
+  "D203", # `one-blank-line-before-class` (D203) and `no-blank-line-before-class` (D211) are incompatible
+  "D213", # `multi-line-summary-first-line` (D212) and `multi-line-summary-second-line` (D213) are incompatible.
+  # The following rules may cause conflicts when used with the formatter: `COM812`, `ISC001`.
+  "COM812",
+  "ISC001",
+]
+select = ["ALL"]
+
+# Allow fix for all enabled rules (when `--fix`) is provided.
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.format]
+indent-style = "space" # Like Black, indent with spaces, rather than tabs.
+line-ending = "auto" # Like Black, automatically detect the appropriate line ending.
+quote-style = "double" # Like Black, use double quotes for strings.
+skip-magic-trailing-comma = false # Like Black, respect magic trailing commas.
