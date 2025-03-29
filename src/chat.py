@@ -3,12 +3,12 @@
 import argparse
 import os
 
-from langchain.callbacks.manager import CallbackManager
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
-from langchain.chains import ConversationChain
-from langchain.memory import ConversationBufferMemory
-from langchain.prompts import PromptTemplate
-from langchain_community.llms import Ollama
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_ollama import OllamaLLM
 
 # LlamaIndex関連のインポート
 from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
@@ -59,36 +59,31 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def create_llm(model_name: str, url: str, temperature: float) -> Ollama:
+def create_llm(model_name: str, url: str, temperature: float) -> OllamaLLM:
     """OllamaモデルのLLMインスタンスを作成する."""
-    callback_manager = CallbackManager([StreamingStdOutCallbackHandler()])
-    return Ollama(
+    return OllamaLLM(
         model=model_name,
         base_url=url,
         temperature=temperature,
-        callback_manager=callback_manager,
+        callbacks=[StreamingStdOutCallbackHandler()],
     )
 
 
-def create_conversation_chain(llm: Ollama) -> ConversationChain:
+def create_conversation_chain(llm: OllamaLLM) -> RunnableWithMessageHistory:
     """会話チェーンを作成する."""
-    template = """以下は人間とAIの親切な会話です。
-AIは会話の文脈を理解し、詳細かつ役立つ回答を提供します。
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "以下は人間とAIの親切な会話です。AIは会話の文脈を理解し、詳細かつ役立つ回答を提供します。"),
+        MessagesPlaceholder(variable_name="history"),
+        ("human", "{input}"),
+    ])
 
-現在の会話:
-{history}
-人間: {input}
-AI: """
+    chain = prompt | llm | StrOutputParser()
 
-    prompt = PromptTemplate(input_variables=["history", "input"], template=template)
-
-    memory = ConversationBufferMemory(return_messages=True)
-
-    return ConversationChain(
-        llm=llm,
-        prompt=prompt,
-        memory=memory,
-        verbose=True,
+    return RunnableWithMessageHistory(
+        chain,
+        lambda session_id: ChatMessageHistory(),
+        input_messages_key="input",
+        history_messages_key="history",
     )
 
 
@@ -118,7 +113,6 @@ def create_rag_index(documents_dir: str, embed_model_name: str, model_name: str,
     )
 
     # 埋め込みモデルの設定
-    # embed_model = resolve_embed_model(embed_model_name)
     embed_model = OllamaEmbedding(
         model_name=embed_model_name,
         base_url=url,
@@ -134,7 +128,7 @@ def create_rag_index(documents_dir: str, embed_model_name: str, model_name: str,
     return VectorStoreIndex.from_documents(documents)
 
 
-def chat_loop(conversation: ConversationChain, index=None) -> None:
+def chat_loop(conversation: RunnableWithMessageHistory, index=None) -> None:
     """チャットのメインループ."""
     rag_mode = index is not None
 
@@ -145,6 +139,8 @@ def chat_loop(conversation: ConversationChain, index=None) -> None:
     print(
         "チャットを開始します。終了するには 'exit' または 'quit' と入力してください。"
     )
+
+    session_id = "default"  # セッションIDを設定
 
     while True:
         user_input = input("\n> ")
@@ -160,10 +156,10 @@ def chat_loop(conversation: ConversationChain, index=None) -> None:
             except Exception as e:
                 print(f"RAG検索中にエラーが発生しました: {e}")
                 # エラーが発生した場合は通常の会話チェーンにフォールバック
-                conversation.predict(input=user_input)
+                conversation.invoke({"input": user_input}, config={"configurable": {"session_id": session_id}})
         else:
             # 通常モードの場合
-            conversation.predict(input=user_input)
+            conversation.invoke({"input": user_input}, config={"configurable": {"session_id": session_id}})
 
 
 def main() -> None:
