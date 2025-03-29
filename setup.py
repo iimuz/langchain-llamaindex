@@ -1,3 +1,4 @@
-[options]
-zip_safe = False
-packages = find:
+"""setup.py"""
+from setuptools import setup
+
+setup()
