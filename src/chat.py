@@ -7,6 +7,7 @@ import os
 
 import chromadb
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
+from langchain.schema import AIMessage, HumanMessage
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -15,6 +16,8 @@ from langchain_ollama import OllamaLLM
 
 # LlamaIndex関連のインポート
 from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
+from llama_index.core.llms import ChatMessage, MessageRole
+from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.storage import StorageContext
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama as LlamaOllama
@@ -271,19 +274,123 @@ def create_rag_index(documents_dir: str, embed_model_name: str, model_name: str,
         return create_rag_index(documents_dir, embed_model_name, model_name, url, temperature, index_dir, force_rebuild=True)
 
 
+# LangChainメモリとLlamaIndexを統合するクラス
+class LangChainLlamaIndexMemoryBridge:
+    """LangChainのメモリとLlamaIndexを統合するためのブリッジクラス."""
+
+    def __init__(self, index, session_id="default", max_history=5):
+        """初期化."""
+        self.index = index
+        self.session_id = session_id
+        self.langchain_history = ChatMessageHistory()
+        self.max_history = max_history
+
+        # LlamaIndexのメモリバッファを作成
+        self.llama_memory = ChatMemoryBuffer.from_defaults(token_limit=4096)
+
+        # チャットエンジンの作成
+        self.chat_engine = index.as_chat_engine(
+            chat_mode="context",
+            memory=self.llama_memory,
+            system_prompt=(
+                "あなたは知識豊富なアシスタントです。"
+                "会話の履歴と与えられた情報を使用して、質問に簡潔かつ正確に答えてください。"
+            )
+        )
+
+        # クエリエンジンも作成
+        self.query_engine = index.as_query_engine(
+            similarity_top_k=3,  # 検索するドキュメント数
+            streaming=True,      # ストリーミング出力対応
+        )
+
+    def add_user_message(self, message: str):
+        """ユーザーメッセージを追加する."""
+        # LangChainのヒストリーに追加
+        human_msg = HumanMessage(content=message)
+        self.langchain_history.add_message(human_msg)
+
+        # LlamaIndexのメモリに追加
+        self.llama_memory.put(ChatMessage(role=MessageRole.USER, content=message))
+
+        return human_msg
+
+    def add_ai_message(self, message: str):
+        """AIメッセージを追加する."""
+        # LangChainのヒストリーに追加
+        ai_msg = AIMessage(content=message)
+        self.langchain_history.add_message(ai_msg)
+
+        # LlamaIndexのメモリに追加
+        self.llama_memory.put(ChatMessage(role=MessageRole.ASSISTANT, content=message))
+
+        return ai_msg
+
+    def get_langchain_messages(self):
+        """LangChainのメッセージ履歴を取得する."""
+        return self.langchain_history.messages
+
+    def get_llama_messages(self):
+        """LlamaIndexのメッセージ履歴を取得する."""
+        return self.llama_memory.get_all()
+
+    def chat(self, message: str) -> str:
+        """チャットエンジンと対話する."""
+        # メッセージをユーザー入力として追加
+        self.add_user_message(message)
+
+        # まず関連文書をクエリで検索
+        query_response = self.query_engine.query(message)
+        retrieved_context = str(query_response)
+
+        # 会話履歴から最近のメッセージを取得
+        history_messages = self.get_langchain_messages()[-self.max_history:]
+        history_context = "\n".join([
+            f"{'ユーザー' if isinstance(msg, HumanMessage) else 'アシスタント'}: {msg.content}"
+            for msg in history_messages
+        ])
+
+        # プロンプトを組み立てる
+        augmented_prompt = (
+            f"次の会話履歴と検索した情報を参考にして、ユーザーの質問に答えてください。\n\n"
+            f"### 会話履歴:\n{history_context}\n\n"
+            f"### 検索情報:\n{retrieved_context}\n\n"
+            f"### 最新の質問:\n{message}\n\n"
+            f"回答:"
+        )
+        print(f"プロンプト:\n{augmented_prompt}\n")
+
+        # チャットエンジンを使用して応答を生成
+        response = self.chat_engine.chat(augmented_prompt)
+
+        # 応答をAI出力として追加
+        self.add_ai_message(str(response))
+
+        return str(response)
+
+    def sync_from_langchain_memory(self, langchain_memory):
+        """LangChainのメモリからメッセージを同期する."""
+        for msg in langchain_memory.messages:
+            if isinstance(msg, HumanMessage):
+                self.llama_memory.put(ChatMessage(role=MessageRole.USER, content=msg.content))
+            elif isinstance(msg, AIMessage):
+                self.llama_memory.put(ChatMessage(role=MessageRole.ASSISTANT, content=msg.content))
+
+
 def chat_loop(conversation: RunnableWithMessageHistory, index=None) -> None:
     """チャットのメインループ."""
     rag_mode = index is not None
+    session_id = "default"  # セッションIDを設定
 
     if rag_mode:
         print("RAGモードが有効です。ドキュメントベースでの回答を提供します。")
-        query_engine = index.as_query_engine()
+        # 統合されたメモリブリッジを作成
+        memory_bridge = LangChainLlamaIndexMemoryBridge(index, session_id)
+        print("インデックスからRAGエンジンを初期化しています...")
 
     print(
         "チャットを開始します。終了するには 'exit' または 'quit' と入力してください。"
     )
-
-    session_id = "default"  # セッションIDを設定
 
     while True:
         user_input = input("\n> ")
@@ -292,17 +399,43 @@ def chat_loop(conversation: RunnableWithMessageHistory, index=None) -> None:
             break
 
         if rag_mode:
-            # RAGモードの場合、ドキュメントから情報を検索
             try:
-                response = query_engine.query(user_input)
-                print(f"\nRAG応答: {response}")
+                # LangChainのメモリにユーザー入力を追加
+                if hasattr(conversation, "_history_dict") and session_id in conversation._history_dict:
+                    conversation._history_dict[session_id].add_message(
+                        HumanMessage(content=user_input)
+                    )
+
+                # LangChainのメモリからLlamaIndexのメモリに同期
+                if hasattr(conversation, "_history_dict") and session_id in conversation._history_dict:
+                    memory_bridge.sync_from_langchain_memory(conversation._history_dict[session_id])
+
+                # 統合されたブリッジを使用して、クエリと会話履歴を活用した応答を生成
+                print("\n検索中...", end="", flush=True)
+                response = memory_bridge.chat(user_input)
+                print("\r" + " " * 10 + "\r", end="")  # 「検索中...」を消す
+                print(f"{response}")
+
+                # 応答をLangChainのメモリに追加
+                if hasattr(conversation, "_history_dict") and session_id in conversation._history_dict:
+                    conversation._history_dict[session_id].add_message(
+                        AIMessage(content=str(response))
+                    )
+
             except Exception as e:
                 print(f"RAG検索中にエラーが発生しました: {e}")
                 # エラーが発生した場合は通常の会話チェーンにフォールバック
-                conversation.invoke({"input": user_input}, config={"configurable": {"session_id": session_id}})
+                print("\n通常の会話モードにフォールバックします...")
+                conversation.invoke(
+                    {"input": user_input},
+                    config={"configurable": {"session_id": session_id}}
+                )
         else:
             # 通常モードの場合
-            conversation.invoke({"input": user_input}, config={"configurable": {"session_id": session_id}})
+            conversation.invoke(
+                {"input": user_input},
+                config={"configurable": {"session_id": session_id}}
+            )
 
 
 def main() -> None:
