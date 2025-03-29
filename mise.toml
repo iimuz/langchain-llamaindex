@@ -1,0 +1,9 @@
+[tools]
+nodejs = "22"
+python = "3.11"
+dprint = "0.49"
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+mise.file = ".env"
+VENV_DIR = ".venv"
