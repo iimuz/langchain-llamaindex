@@ -15,7 +15,12 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_ollama import OllamaLLM
 
 # LlamaIndex関連のインポート
-from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
+from llama_index.core import (
+    PromptTemplate,
+    Settings,
+    SimpleDirectoryReader,
+    VectorStoreIndex,
+)
 from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.storage import StorageContext
@@ -35,47 +40,35 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         default="hf.co/mmnga/sarashina2.2-3b-instruct-v0.1-gguf:Q4_K_M",
-        help="使用するOllamaモデルの名前"
+        help="使用するOllamaモデルの名前",
     )
     parser.add_argument(
-        "--url",
-        type=str,
-        default="http://localhost:11434",
-        help="OllamaサーバーのURL"
+        "--url", type=str, default="http://localhost:11434", help="OllamaサーバーのURL"
     )
     parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.7,
-        help="生成時の温度パラメータ"
+        "--temperature", type=float, default=0.7, help="生成時の温度パラメータ"
     )
     parser.add_argument(
         "--embed-model",
         type=str,
         default="nomic-embed-text",
-        help="埋め込みモデルの名前"
+        help="埋め込みモデルの名前",
     )
     parser.add_argument(
         "--documents",
         type=str,
         default="./documents",
-        help="インデックスを作成するドキュメントのディレクトリ"
+        help="インデックスを作成するドキュメントのディレクトリ",
     )
     parser.add_argument(
         "--index-dir",
         type=str,
         default="./index_storage",
-        help="インデックスを保存するディレクトリ"
+        help="インデックスを保存するディレクトリ",
     )
+    parser.add_argument("--rag-mode", action="store_true", help="RAGモードを有効にする")
     parser.add_argument(
-        "--rag-mode",
-        action="store_true",
-        help="RAGモードを有効にする"
-    )
-    parser.add_argument(
-        "--force-rebuild",
-        action="store_true",
-        help="インデックスを強制的に再構築する"
+        "--force-rebuild", action="store_true", help="インデックスを強制的に再構築する"
     )
     return parser.parse_args()
 
@@ -92,11 +85,16 @@ def create_llm(model_name: str, url: str, temperature: float) -> OllamaLLM:
 
 def create_conversation_chain(llm: OllamaLLM) -> RunnableWithMessageHistory:
     """会話チェーンを作成する."""
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "以下は人間とAIの親切な会話です。AIは会話の文脈を理解し、詳細かつ役立つ回答を提供します。"),
-        MessagesPlaceholder(variable_name="history"),
-        ("human", "{input}"),
-    ])
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "以下は人間とAIの親切な会話です。AIは会話の文脈を理解し、詳細かつ役立つ回答を提供します。",
+            ),
+            MessagesPlaceholder(variable_name="history"),
+            ("human", "{input}"),
+        ]
+    )
 
     chain = prompt | llm | StrOutputParser()
 
@@ -147,7 +145,9 @@ def load_hash_info(index_dir: str) -> str:
         return f.read().strip()
 
 
-def should_rebuild_index(documents_dir: str, index_dir: str, force_rebuild: bool) -> bool:
+def should_rebuild_index(
+    documents_dir: str, index_dir: str, force_rebuild: bool
+) -> bool:
     """インデックスを再構築する必要があるか判断する."""
     if force_rebuild:
         print("強制再構築フラグが設定されています。インデックスを再構築します。")
@@ -175,7 +175,15 @@ def should_rebuild_index(documents_dir: str, index_dir: str, force_rebuild: bool
     return False
 
 
-def create_rag_index(documents_dir: str, embed_model_name: str, model_name: str, url: str, temperature: float, index_dir: str, force_rebuild: bool = False):
+def create_rag_index(
+    documents_dir: str,
+    embed_model_name: str,
+    model_name: str,
+    url: str,
+    temperature: float,
+    index_dir: str,
+    force_rebuild: bool = False,
+):
     """RAGのためのインデックスを作成する."""
     # ドキュメントディレクトリが存在するか確認
     if not os.path.exists(documents_dir):
@@ -217,12 +225,15 @@ def create_rag_index(documents_dir: str, embed_model_name: str, model_name: str,
             print(f"ディレクトリ '{documents_dir}' にドキュメントが見つかりません。")
             return None
 
-        print(f"{len(documents)}個のドキュメントを読み込みました。インデックスを構築中...")
+        print(
+            f"{len(documents)}個のドキュメントを読み込みました。インデックスを構築中..."
+        )
 
         # 既存のChromaDBがあれば削除して新規作成
         if os.path.exists(chroma_dir):
             try:
                 import shutil
+
                 shutil.rmtree(chroma_dir)
                 print(f"既存のChromaデータベースを削除しました: {chroma_dir}")
             except Exception as e:
@@ -271,7 +282,15 @@ def create_rag_index(documents_dir: str, embed_model_name: str, model_name: str,
         print(f"インデックスの読み込み中にエラーが発生しました: {e}")
         print("インデックスを再構築します...")
         # エラーが発生した場合は再構築を試みる
-        return create_rag_index(documents_dir, embed_model_name, model_name, url, temperature, index_dir, force_rebuild=True)
+        return create_rag_index(
+            documents_dir,
+            embed_model_name,
+            model_name,
+            url,
+            temperature,
+            index_dir,
+            force_rebuild=True,
+        )
 
 
 # LangChainメモリとLlamaIndexを統合するクラス
@@ -288,6 +307,25 @@ class LangChainLlamaIndexMemoryBridge:
         # LlamaIndexのメモリバッファを作成
         self.llama_memory = ChatMemoryBuffer.from_defaults(token_limit=4096)
 
+        text_qa_template_str = (
+            "Context information is"
+            " below.\n---------------------\n{context_str}\n---------------------\nUsing"
+            " both the context information and also using your own knowledge, answer"
+            " the question: {query_str}\nIf the context isn't helpful, you can also"
+            " answer the question on your own. and answer in japanese,\n"
+        )
+        text_qa_template = PromptTemplate(text_qa_template_str)
+
+        refine_template_str = (
+            "The original question is as follows: {query_str}\nWe have provided an"
+            " existing answer: {existing_answer}\nWe have the opportunity to refine"
+            " the existing answer (only if needed) with some more context"
+            " below.\n------------\n{context_msg}\n------------\nUsing both the new"
+            " context and your own knowledge, update or repeat the existing answer."
+            " And answer in japanese.\n"
+        )
+        refine_template = PromptTemplate(refine_template_str)
+
         # チャットエンジンの作成
         self.chat_engine = index.as_chat_engine(
             chat_mode="context",
@@ -295,13 +333,25 @@ class LangChainLlamaIndexMemoryBridge:
             system_prompt=(
                 "あなたは知識豊富なアシスタントです。"
                 "会話の履歴と与えられた情報を使用して、質問に簡潔かつ正確に答えてください。"
-            )
+            ),
         )
 
         # クエリエンジンも作成
         self.query_engine = index.as_query_engine(
             similarity_top_k=3,  # 検索するドキュメント数
-            streaming=True,      # ストリーミング出力対応
+            streaming=True,  # ストリーミング出力対応
+            similarity_cutoff=0.7,  # 類似度カットオフ
+            text_qa_template=text_qa_template,
+            refine_template=refine_template,
+        )
+        self.query_chat_engine = index.as_chat_engine(
+            chat_mode="condense_question",
+            verbose=True,
+            similarity_top_k=3,  # 検索するドキュメント数
+            similarity_cutoff=0.7,  # 類似度カットオフ
+            memory=self.llama_memory,
+            text_qa_template=text_qa_template,
+            refine_template=refine_template,
         )
 
     def add_user_message(self, message: str):
@@ -340,31 +390,53 @@ class LangChainLlamaIndexMemoryBridge:
         self.add_user_message(message)
 
         # まず関連文書をクエリで検索
-        query_response = self.query_engine.query(message)
-        retrieved_context = str(query_response)
+        # query_response = self.query_engine.query(message)
+        query_response = self.query_chat_engine.chat(message)
+        # retrieved_context = str(query_response)
+
+        # 参照情報の抽出と整形
+        reference_info = ""
+        if hasattr(query_response, "source_nodes") and query_response.source_nodes:
+            reference_info = "### 参照情報:\n"
+            for i, node in enumerate(query_response.source_nodes):
+                score = node.score if hasattr(node, "score") else "不明"
+                metadata = (
+                    node.node.metadata
+                    if hasattr(node, "node") and hasattr(node.node, "metadata")
+                    else {}
+                )
+
+                file_name = metadata.get("file_name", "不明")
+                file_path = metadata.get("file_path", "不明")
+
+                reference_info += f"{i + 1}. ファイル: {file_name}\n"
+                reference_info += f"   パス: {file_path}\n"
+                reference_info += f"   スコア: {score}\n\n"
 
         # 会話履歴から最近のメッセージを取得
-        history_messages = self.get_langchain_messages()[-self.max_history:]
-        history_context = "\n".join([
-            f"{'ユーザー' if isinstance(msg, HumanMessage) else 'アシスタント'}: {msg.content}"
-            for msg in history_messages
-        ])
+        # history_messages = self.get_langchain_messages()[-self.max_history:]
+        # history_context = "\n".join([
+        #     f"{'ユーザー' if isinstance(msg, HumanMessage) else 'アシスタント'}: {msg.content}"
+        #     for msg in history_messages
+        # ])
 
         # プロンプトを組み立てる
-        augmented_prompt = (
-            f"次の会話履歴と検索した情報を参考にして、ユーザーの質問に答えてください。\n\n"
-            f"### 会話履歴:\n{history_context}\n\n"
-            f"### 検索情報:\n{retrieved_context}\n\n"
-            f"### 最新の質問:\n{message}\n\n"
-            f"回答:"
-        )
-        print(f"プロンプト:\n{augmented_prompt}\n")
+        # augmented_prompt = (
+        #     f"次の会話履歴と検索した情報を参考にして、ユーザーの質問に答えてください。\n\n"
+        #     f"### 会話履歴:\n{history_context}\n\n"
+        #     f"### 検索情報:\n{retrieved_context}\n\n"
+        #     f"### 最新の質問:\n{message}\n\n"
+        #     f"回答:"
+        # )
+        # print(f"プロンプト:\n{augmented_prompt}\n")
+        print(f"{reference_info}")
 
         # チャットエンジンを使用して応答を生成
-        response = self.chat_engine.chat(augmented_prompt)
+        # response = self.chat_engine.chat(augmented_prompt)
+        response = query_response
 
         # 応答をAI出力として追加
-        self.add_ai_message(str(response))
+        # self.add_ai_message(str(response))
 
         return str(response)
 
@@ -372,9 +444,13 @@ class LangChainLlamaIndexMemoryBridge:
         """LangChainのメモリからメッセージを同期する."""
         for msg in langchain_memory.messages:
             if isinstance(msg, HumanMessage):
-                self.llama_memory.put(ChatMessage(role=MessageRole.USER, content=msg.content))
+                self.llama_memory.put(
+                    ChatMessage(role=MessageRole.USER, content=msg.content)
+                )
             elif isinstance(msg, AIMessage):
-                self.llama_memory.put(ChatMessage(role=MessageRole.ASSISTANT, content=msg.content))
+                self.llama_memory.put(
+                    ChatMessage(role=MessageRole.ASSISTANT, content=msg.content)
+                )
 
 
 def chat_loop(conversation: RunnableWithMessageHistory, index=None) -> None:
@@ -401,14 +477,22 @@ def chat_loop(conversation: RunnableWithMessageHistory, index=None) -> None:
         if rag_mode:
             try:
                 # LangChainのメモリにユーザー入力を追加
-                if hasattr(conversation, "_history_dict") and session_id in conversation._history_dict:
+                if (
+                    hasattr(conversation, "_history_dict")
+                    and session_id in conversation._history_dict
+                ):
                     conversation._history_dict[session_id].add_message(
                         HumanMessage(content=user_input)
                     )
 
                 # LangChainのメモリからLlamaIndexのメモリに同期
-                if hasattr(conversation, "_history_dict") and session_id in conversation._history_dict:
-                    memory_bridge.sync_from_langchain_memory(conversation._history_dict[session_id])
+                if (
+                    hasattr(conversation, "_history_dict")
+                    and session_id in conversation._history_dict
+                ):
+                    memory_bridge.sync_from_langchain_memory(
+                        conversation._history_dict[session_id]
+                    )
 
                 # 統合されたブリッジを使用して、クエリと会話履歴を活用した応答を生成
                 print("\n検索中...", end="", flush=True)
@@ -417,7 +501,10 @@ def chat_loop(conversation: RunnableWithMessageHistory, index=None) -> None:
                 print(f"{response}")
 
                 # 応答をLangChainのメモリに追加
-                if hasattr(conversation, "_history_dict") and session_id in conversation._history_dict:
+                if (
+                    hasattr(conversation, "_history_dict")
+                    and session_id in conversation._history_dict
+                ):
                     conversation._history_dict[session_id].add_message(
                         AIMessage(content=str(response))
                     )
@@ -428,13 +515,13 @@ def chat_loop(conversation: RunnableWithMessageHistory, index=None) -> None:
                 print("\n通常の会話モードにフォールバックします...")
                 conversation.invoke(
                     {"input": user_input},
-                    config={"configurable": {"session_id": session_id}}
+                    config={"configurable": {"session_id": session_id}},
                 )
         else:
             # 通常モードの場合
             conversation.invoke(
                 {"input": user_input},
-                config={"configurable": {"session_id": session_id}}
+                config={"configurable": {"session_id": session_id}},
             )
 
 
@@ -458,7 +545,7 @@ def main() -> None:
             args.url,
             args.temperature,
             args.index_dir,
-            args.force_rebuild
+            args.force_rebuild,
         )
 
     # チャットループの開始
