@@ -7,7 +7,6 @@ import os
 
 import chromadb
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
-from langchain.schema import AIMessage, HumanMessage
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -16,18 +15,13 @@ from langchain_ollama import OllamaLLM
 
 # LlamaIndex関連のインポート
 from llama_index.core import (
-    PromptTemplate,
     Settings,
     SimpleDirectoryReader,
     VectorStoreIndex,
 )
-from llama_index.core.llms import ChatMessage, MessageRole
-from llama_index.core.memory import ChatMemoryBuffer
+from llama_index.core.schema import NodeWithScore
 from llama_index.core.storage import StorageContext
 from llama_index.embeddings.ollama import OllamaEmbedding
-from llama_index.llms.ollama import Ollama as LlamaOllama
-
-# SQLiteVectorStoreの代わりにChromaVectorStoreをインポート
 from llama_index.vector_stores.chroma import ChromaVectorStore
 
 
@@ -84,7 +78,7 @@ def create_llm(model_name: str, url: str, temperature: float) -> OllamaLLM:
 
 
 def create_conversation_chain(llm: OllamaLLM) -> RunnableWithMessageHistory:
-    """会話チェーンを作成する."""
+    """通常の会話チェーンを作成する."""
     prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -93,6 +87,38 @@ def create_conversation_chain(llm: OllamaLLM) -> RunnableWithMessageHistory:
             ),
             MessagesPlaceholder(variable_name="history"),
             ("human", "{input}"),
+        ]
+    )
+
+    chain = prompt | llm | StrOutputParser()
+
+    return RunnableWithMessageHistory(
+        chain,
+        lambda session_id: ChatMessageHistory(),
+        input_messages_key="input",
+        history_messages_key="history",
+    )
+
+
+def create_rag_conversation_chain(llm: OllamaLLM) -> RunnableWithMessageHistory:
+    """RAG用の会話チェーンを作成する."""
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """以下は人間とAIの親切な会話です。AIは会話の文脈を理解し、詳細かつ役立つ回答を提供します。
+                関連文書の情報が提供されている場合は、それを参考にして回答してください。
+                ただし、関連文書に情報がない場合は、あなた自身の知識で回答してください。""",
+            ),
+            MessagesPlaceholder(variable_name="history"),
+            ("human", "{input}"),
+            (
+                "system",
+                """### 関連文書:
+                {context}
+
+                上記の関連文書と自分の知識を組み合わせて、ユーザーの質問に答えてください。"""
+            ),
         ]
     )
 
@@ -175,30 +201,21 @@ def should_rebuild_index(
     return False
 
 
-def create_rag_index(
+def create_vector_index(
     documents_dir: str,
     embed_model_name: str,
-    model_name: str,
     url: str,
     temperature: float,
     index_dir: str,
     force_rebuild: bool = False,
-):
-    """RAGのためのインデックスを作成する."""
+) -> VectorStoreIndex | None:
+    """RAGのためのベクトルインデックスを作成する."""
     # ドキュメントディレクトリが存在するか確認
     if not os.path.exists(documents_dir):
         os.makedirs(documents_dir)
         print(f"ディレクトリ '{documents_dir}' が存在しなかったため作成しました。")
         print("このディレクトリにドキュメントを配置してください。")
         return None
-
-    # LlamaIndexのLLM設定
-    llm = LlamaOllama(
-        model=model_name,
-        base_url=url,
-        temperature=temperature,
-        request_timeout=120.0,
-    )
 
     # 埋め込みモデルの設定
     embed_model = OllamaEmbedding(
@@ -209,7 +226,7 @@ def create_rag_index(
     )
 
     # グローバル設定
-    Settings.llm = llm
+    Settings.llm = None
     Settings.embed_model = embed_model
 
     # インデックスの保存先を確保
@@ -282,10 +299,9 @@ def create_rag_index(
         print(f"インデックスの読み込み中にエラーが発生しました: {e}")
         print("インデックスを再構築します...")
         # エラーが発生した場合は再構築を試みる
-        return create_rag_index(
+        return create_vector_index(
             documents_dir,
             embed_model_name,
-            model_name,
             url,
             temperature,
             index_dir,
@@ -293,176 +309,77 @@ def create_rag_index(
         )
 
 
-# LangChainメモリとLlamaIndexを統合するクラス
-class LangChainLlamaIndexMemoryBridge:
-    """LangChainのメモリとLlamaIndexを統合するためのブリッジクラス."""
+def query_vector_index(
+    index: VectorStoreIndex, query: str, similarity_top_k: int = 3
+) -> dict:
+    """ベクトルインデックスにクエリを実行し、関連ドキュメントを取得する"""
+    if not index:
+        return {"text": "", "sources": []}
 
-    def __init__(self, index, session_id="default", max_history=5):
-        """初期化."""
-        self.index = index
-        self.session_id = session_id
-        self.langchain_history = ChatMessageHistory()
-        self.max_history = max_history
+    # クエリエンジンの作成
+    query_engine = index.as_query_engine(
+        similarity_top_k=similarity_top_k, similarity_cutoff=0.7
+    )
 
-        # LlamaIndexのメモリバッファを作成
-        self.llama_memory = ChatMemoryBuffer.from_defaults(token_limit=4096)
+    # クエリの実行
+    response = query_engine.query(query)
 
-        text_qa_template_str = (
-            "Context information is"
-            " below.\n---------------------\n{context_str}\n---------------------\nUsing"
-            " both the context information and also using your own knowledge, answer"
-            " the question: {query_str}\nIf the context isn't helpful, you can also"
-            " answer the question on your own. and answer in japanese,\n"
-        )
-        text_qa_template = PromptTemplate(text_qa_template_str)
+    # ソースノードの抽出
+    sources = []
+    if hasattr(response, "source_nodes"):
+        for i, node in enumerate(response.source_nodes):
+            if isinstance(node, NodeWithScore):
+                source = {
+                    "score": node.score if hasattr(node, "score") else "不明",
+                    "file_name": node.node.metadata.get("file_name", "不明") if hasattr(node.node, "metadata") else "不明",
+                    "file_path": node.node.metadata.get("file_path", "不明") if hasattr(node.node, "metadata") else "不明",
+                    "text": node.node.text if hasattr(node.node, "text") else "",
+                }
+                sources.append(source)
 
-        refine_template_str = (
-            "The original question is as follows: {query_str}\nWe have provided an"
-            " existing answer: {existing_answer}\nWe have the opportunity to refine"
-            " the existing answer (only if needed) with some more context"
-            " below.\n------------\n{context_msg}\n------------\nUsing both the new"
-            " context and your own knowledge, update or repeat the existing answer."
-            " And answer in japanese.\n"
-        )
-        refine_template = PromptTemplate(refine_template_str)
-
-        # チャットエンジンの作成
-        self.chat_engine = index.as_chat_engine(
-            chat_mode="context",
-            memory=self.llama_memory,
-            system_prompt=(
-                "あなたは知識豊富なアシスタントです。"
-                "会話の履歴と与えられた情報を使用して、質問に簡潔かつ正確に答えてください。"
-            ),
-        )
-
-        # クエリエンジンも作成
-        self.query_engine = index.as_query_engine(
-            similarity_top_k=3,  # 検索するドキュメント数
-            streaming=True,  # ストリーミング出力対応
-            similarity_cutoff=0.7,  # 類似度カットオフ
-            text_qa_template=text_qa_template,
-            refine_template=refine_template,
-        )
-        self.query_chat_engine = index.as_chat_engine(
-            chat_mode="condense_question",
-            verbose=True,
-            similarity_top_k=3,  # 検索するドキュメント数
-            similarity_cutoff=0.7,  # 類似度カットオフ
-            memory=self.llama_memory,
-            text_qa_template=text_qa_template,
-            refine_template=refine_template,
-        )
-
-    def add_user_message(self, message: str):
-        """ユーザーメッセージを追加する."""
-        # LangChainのヒストリーに追加
-        human_msg = HumanMessage(content=message)
-        self.langchain_history.add_message(human_msg)
-
-        # LlamaIndexのメモリに追加
-        self.llama_memory.put(ChatMessage(role=MessageRole.USER, content=message))
-
-        return human_msg
-
-    def add_ai_message(self, message: str):
-        """AIメッセージを追加する."""
-        # LangChainのヒストリーに追加
-        ai_msg = AIMessage(content=message)
-        self.langchain_history.add_message(ai_msg)
-
-        # LlamaIndexのメモリに追加
-        self.llama_memory.put(ChatMessage(role=MessageRole.ASSISTANT, content=message))
-
-        return ai_msg
-
-    def get_langchain_messages(self):
-        """LangChainのメッセージ履歴を取得する."""
-        return self.langchain_history.messages
-
-    def get_llama_messages(self):
-        """LlamaIndexのメッセージ履歴を取得する."""
-        return self.llama_memory.get_all()
-
-    def chat(self, message: str) -> str:
-        """チャットエンジンと対話する."""
-        # メッセージをユーザー入力として追加
-        self.add_user_message(message)
-
-        # まず関連文書をクエリで検索
-        # query_response = self.query_engine.query(message)
-        query_response = self.query_chat_engine.chat(message)
-        # retrieved_context = str(query_response)
-
-        # 参照情報の抽出と整形
-        reference_info = ""
-        if hasattr(query_response, "source_nodes") and query_response.source_nodes:
-            reference_info = "### 参照情報:\n"
-            for i, node in enumerate(query_response.source_nodes):
-                score = node.score if hasattr(node, "score") else "不明"
-                metadata = (
-                    node.node.metadata
-                    if hasattr(node, "node") and hasattr(node.node, "metadata")
-                    else {}
-                )
-
-                file_name = metadata.get("file_name", "不明")
-                file_path = metadata.get("file_path", "不明")
-
-                reference_info += f"{i + 1}. ファイル: {file_name}\n"
-                reference_info += f"   パス: {file_path}\n"
-                reference_info += f"   スコア: {score}\n\n"
-
-        # 会話履歴から最近のメッセージを取得
-        # history_messages = self.get_langchain_messages()[-self.max_history:]
-        # history_context = "\n".join([
-        #     f"{'ユーザー' if isinstance(msg, HumanMessage) else 'アシスタント'}: {msg.content}"
-        #     for msg in history_messages
-        # ])
-
-        # プロンプトを組み立てる
-        # augmented_prompt = (
-        #     f"次の会話履歴と検索した情報を参考にして、ユーザーの質問に答えてください。\n\n"
-        #     f"### 会話履歴:\n{history_context}\n\n"
-        #     f"### 検索情報:\n{retrieved_context}\n\n"
-        #     f"### 最新の質問:\n{message}\n\n"
-        #     f"回答:"
-        # )
-        # print(f"プロンプト:\n{augmented_prompt}\n")
-        print(f"{reference_info}")
-
-        # チャットエンジンを使用して応答を生成
-        # response = self.chat_engine.chat(augmented_prompt)
-        response = query_response
-
-        # 応答をAI出力として追加
-        # self.add_ai_message(str(response))
-
-        return str(response)
-
-    def sync_from_langchain_memory(self, langchain_memory):
-        """LangChainのメモリからメッセージを同期する."""
-        for msg in langchain_memory.messages:
-            if isinstance(msg, HumanMessage):
-                self.llama_memory.put(
-                    ChatMessage(role=MessageRole.USER, content=msg.content)
-                )
-            elif isinstance(msg, AIMessage):
-                self.llama_memory.put(
-                    ChatMessage(role=MessageRole.ASSISTANT, content=msg.content)
-                )
+    return {
+        "text": str(response),
+        "sources": sources,
+    }
 
 
-def chat_loop(conversation: RunnableWithMessageHistory, index=None) -> None:
+def format_context_from_query_result(query_result: dict) -> str:
+    """検索結果からコンテキストを整形する"""
+    context = ""
+
+    # 関連テキストがあれば追加
+    if query_result.get("text"):
+        context += f"{query_result['text']}\n\n"
+
+    # ソース情報があれば追加
+    if query_result.get("sources") and len(query_result["sources"]) > 0:
+        context += "参照情報:\n"
+        for i, source in enumerate(query_result["sources"]):
+            context += f"{i+1}. ファイル: {source.get('file_name', '不明')}\n"
+            if source.get("text"):
+                # テキストの長さを制限（必要に応じて調整）
+                text = source["text"]
+                if len(text) > 300:
+                    text = text[:300] + "..."
+                context += f"   内容: {text}\n"
+            context += f"   関連度: {source.get('score', '不明')}\n\n"
+
+    return context
+
+
+def chat_loop(
+    conversation: RunnableWithMessageHistory,
+    rag_conversation: RunnableWithMessageHistory,
+    index: VectorStoreIndex | None = None,
+) -> None:
     """チャットのメインループ."""
     rag_mode = index is not None
-    session_id = "default"  # セッションIDを設定
+    session_id = "default"  # セッションID
 
     if rag_mode:
         print("RAGモードが有効です。ドキュメントベースでの回答を提供します。")
-        # 統合されたメモリブリッジを作成
-        memory_bridge = LangChainLlamaIndexMemoryBridge(index, session_id)
-        print("インデックスからRAGエンジンを初期化しています...")
+    else:
+        print("通常モードで起動しています。RAG機能は無効です。")
 
     print(
         "チャットを開始します。終了するには 'exit' または 'quit' と入力してください。"
@@ -474,51 +391,36 @@ def chat_loop(conversation: RunnableWithMessageHistory, index=None) -> None:
             print("チャットを終了します。")
             break
 
-        if rag_mode:
-            try:
-                # LangChainのメモリにユーザー入力を追加
-                if (
-                    hasattr(conversation, "_history_dict")
-                    and session_id in conversation._history_dict
-                ):
-                    conversation._history_dict[session_id].add_message(
-                        HumanMessage(content=user_input)
-                    )
-
-                # LangChainのメモリからLlamaIndexのメモリに同期
-                if (
-                    hasattr(conversation, "_history_dict")
-                    and session_id in conversation._history_dict
-                ):
-                    memory_bridge.sync_from_langchain_memory(
-                        conversation._history_dict[session_id]
-                    )
-
-                # 統合されたブリッジを使用して、クエリと会話履歴を活用した応答を生成
+        try:
+            if rag_mode:
+                # インデックスからコンテキストを検索
                 print("\n検索中...", end="", flush=True)
-                response = memory_bridge.chat(user_input)
+                query_result = query_vector_index(index, user_input)
                 print("\r" + " " * 10 + "\r", end="")  # 「検索中...」を消す
-                print(f"{response}")
 
-                # 応答をLangChainのメモリに追加
-                if (
-                    hasattr(conversation, "_history_dict")
-                    and session_id in conversation._history_dict
-                ):
-                    conversation._history_dict[session_id].add_message(
-                        AIMessage(content=str(response))
-                    )
+                # コンテキストを整形
+                context = format_context_from_query_result(query_result)
 
-            except Exception as e:
-                print(f"RAG検索中にエラーが発生しました: {e}")
-                # エラーが発生した場合は通常の会話チェーンにフォールバック
-                print("\n通常の会話モードにフォールバックします...")
+                # RAG用の会話チェーンを実行
+                rag_conversation.invoke(
+                    {"input": user_input, "context": context},
+                    config={"configurable": {"session_id": session_id}},
+                )
+
+                # 参照情報があれば表示
+                if query_result.get("sources") and len(query_result["sources"]) > 0:
+                    print("\n参照ドキュメント:")
+                    for i, source in enumerate(query_result["sources"]):
+                        print(f"  {i+1}. {source.get('file_name', '不明')}")
+            else:
+                # 通常の会話チェーンを実行
                 conversation.invoke(
                     {"input": user_input},
                     config={"configurable": {"session_id": session_id}},
                 )
-        else:
-            # 通常モードの場合
+        except Exception as e:
+            print(f"エラーが発生しました: {e}")
+            print("通常の会話モードにフォールバックします...")
             conversation.invoke(
                 {"input": user_input},
                 config={"configurable": {"session_id": session_id}},
@@ -532,16 +434,17 @@ def main() -> None:
     # LLMインスタンスの作成
     llm = create_llm(args.model, args.url, args.temperature)
 
-    # 会話チェーンの作成
+    # 通常の会話チェーンの作成
     conversation = create_conversation_chain(llm)
 
-    # RAGモードの場合はインデックスを作成
+    # RAG用の会話チェーンとインデックスの作成
+    rag_conversation = create_rag_conversation_chain(llm)
     index = None
+
     if args.rag_mode:
-        index = create_rag_index(
+        index = create_vector_index(
             args.documents,
             args.embed_model,
-            args.model,
             args.url,
             args.temperature,
             args.index_dir,
@@ -549,7 +452,7 @@ def main() -> None:
         )
 
     # チャットループの開始
-    chat_loop(conversation, index)
+    chat_loop(conversation, rag_conversation, index)
 
 
 if __name__ == "__main__":
